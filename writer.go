@@ -3,9 +3,11 @@ package vcd
 import (
 	"bufio"
 	"fmt"
+	"github.com/sirupsen/logrus"
 	"os"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 )
 
@@ -29,6 +31,9 @@ type VcdWriter struct {
 	variableDefiner     int
 	stringIdentifierMap map[string]VcdDataType
 	previousTime        uint64
+	mu                  *sync.RWMutex
+	cmu                 *sync.RWMutex
+	time                uint64
 }
 
 // Creates a new VCDWriter object
@@ -46,6 +51,9 @@ func New(filename string, timeScale string) (VcdWriter, error) {
 		stringIdentifierMap: make(map[string]VcdDataType),
 		previousTime:        0,
 	}
+	writer.mu = &sync.RWMutex{}
+	writer.cmu = &sync.RWMutex{}
+
 	if err == nil {
 		dat := time.Now().Format("01-02-2006 15:04:05")
 		check2(writer.buffered.WriteString("$date\n\t" + dat + "\n$end\n"))
@@ -104,17 +112,24 @@ func check2(nums int, e error) {
 // Variables is an array of VcdDatatTypes
 // See writer.go -> NewVariable
 func (vcd *VcdWriter) RegisterVariables(module string, variables ...VcdDataType) (map[string]VcdDataType, error) {
+
+	vcd.mu.Lock()
 	check2(vcd.buffered.WriteString("$scope module " + module + " $end\n"))
 	for _, variable := range variables {
+
+		variableHashID := variable.VariableName
+		logrus.Infof("xx: %s %s", variable.VariableName, module)
 		check(initVariable(&variable, string(vcd.variableDefiner)))
 
 		vcd.variableDefiner = vcd.variableDefiner + 1
 		response := fmt.Sprintf("%s %d %s %s", variable.VariableType, variable.BitDepth, variable.identifier, variable.VariableName)
-		vcd.stringIdentifierMap[variable.VariableName] = variable
+		logrus.Info("xx var hash id: ", variableHashID)
+		vcd.stringIdentifierMap[variableHashID] = variable
 		check2(vcd.buffered.WriteString("$var " + response + " $end\n"))
 	}
 	check2(vcd.buffered.WriteString("$upscope $end\n"))
 	check2(vcd.buffered.WriteString("$enddefinitions $end\n"))
+	vcd.mu.Unlock()
 	return vcd.stringIdentifierMap, nil
 }
 
@@ -129,11 +144,17 @@ func (vcd *VcdWriter) DumpValues(identifierToValue map[string]string) {
 	_, e = vcd.buffered.WriteString("$end\n")
 	check(e)
 }
+func (vcd *VcdWriter) SetTime(c uint64) {
+	vcd.cmu.Lock()
+	vcd.time = c
+	vcd.cmu.Unlock()
+}
 
 // Sets a valie for a specific variable
 // Time in timeunits, always has to be the same, or larger as the previous time
 // Panics when value can not be marshaled, or when there are problems with the time
 func (vcd *VcdWriter) SetValue(time uint64, value string, variableName string) error {
+	vcd.mu.Lock()
 	if time < vcd.previousTime {
 		return fmt.Errorf("changing value from an earlier time: %d < %d", time, vcd.previousTime)
 	}
@@ -143,13 +164,44 @@ func (vcd *VcdWriter) SetValue(time uint64, value string, variableName string) e
 	}
 	format, e := vcd.stringIdentifierMap[variableName].marshal.format(value)
 	if e != nil {
-		if e == duplicateErr{
+		if e == duplicateErr {
 			return nil
-		}else{
+		} else {
 			panic(e)
 		}
 	}
 	check2(vcd.buffered.WriteString(format + " " + vcd.stringIdentifierMap[variableName].identifier + "\n"))
+	vcd.mu.Unlock()
+	return e
+}
+
+// Sets a valie for a specific variable
+// Time in timeunits, always has to be the same, or larger as the previous time
+// Panics when value can not be marshaled, or when there are problems with the time
+func (vcd *VcdWriter) SetValueTime(value, moduleName, variableName string) error {
+	variableHashID := fmt.Sprintf("%s_%s", variableName, moduleName)
+	logrus.Info("variableHash: ", variableHashID)
+	vcd.mu.Lock()
+	if vcd.time < vcd.previousTime {
+		return fmt.Errorf("changing value from an earlier time: %d < %d", vcd.time, vcd.previousTime)
+	}
+	if vcd.time != vcd.previousTime {
+		_, _ = vcd.buffered.WriteString("#" + strconv.FormatUint(vcd.time, 10) + "\n")
+		vcd.previousTime = vcd.time
+	}
+	logrus.Info("variableHASHID: ", variableHashID)
+	format, e := vcd.stringIdentifierMap[variableHashID].marshal.format(value)
+	if e != nil {
+		if e == duplicateErr {
+			return nil
+		} else {
+			panic(e)
+		}
+	}
+	valueString := format + " " + vcd.stringIdentifierMap[variableHashID].identifier
+	logrus.Info("Value string: ", valueString)
+	check2(vcd.buffered.WriteString(valueString + "\n"))
+	vcd.mu.Unlock()
 	return e
 }
 
